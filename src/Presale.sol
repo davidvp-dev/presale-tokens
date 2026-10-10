@@ -14,6 +14,9 @@ error InvalidPhasePrice(uint256 index);
 error InvalidPhaseEndTime(uint256 index);
 error PhasePriceNotIncreasing(uint256 index);
 error InvalidTotalPhaseAmount(uint256 total, uint256 max);
+error PresaleNotStarted();
+error PresaleTimeFinished();
+error PresaleSoldOut();
 
 /*
 * Phase 1) 2M tokens at 0,005$
@@ -43,7 +46,6 @@ contract Presale is Ownable {
 
     address public fundsReceiver;
     uint256 public totalSold;
-    uint256 public currentPhase;
     Phase[PRESALE_PHASES] public phases;
 
     mapping(address => bool) public isBlacklisted;
@@ -59,7 +61,10 @@ contract Presale is Ownable {
         uint256 STARTING_PERIOD_,
         Phase[PRESALE_PHASES] memory phases_
     ) Ownable(msg.sender) {
-        if (usdc_ == address(0) || usdt_ == address(0) || fundsReceiver_ == address(0) || presaleTokenAddress_ == address(0)) {
+        if (
+            usdc_ == address(0) || usdt_ == address(0) || fundsReceiver_ == address(0)
+                || presaleTokenAddress_ == address(0)
+        ) {
             revert ZeroAddress();
         }
         if (usdc_ == usdt_) revert SameStablecoin();
@@ -89,21 +94,37 @@ contract Presale is Ownable {
         ENDING_PERIOD = phases_[PRESALE_PHASES - 1].endTime;
     }
 
-    function buyWithStables(address tokenUsedToBuy_, uint256 amount_) external {
+    function buyWithStables(address tokenUsedToBuy_, uint256 amountToPay_) external {
         require(!isBlacklisted[msg.sender], "You are not allowed to buy this presale");
-        require(block.timestamp >= STARTING_PERIOD && block.timestamp <= ENDING_PERIOD, "Presale not available");
         require(tokenUsedToBuy_ == USDT || tokenUsedToBuy_ == USDC, "Please use USDC or USDT to buy");
 
+        (uint256 currentPhase, uint256 accumulatedTokens) = calculateCurrentPhase();
         uint256 tokenDecimals_ = IERC20Metadata(tokenUsedToBuy_).decimals();
-        uint256 tokenAmountToReceive = amount_ * 10 ** (18 - tokenDecimals_) * PRICE_USD_DECIMALS / phases[currentPhase].price; // 18 decimals
-        checkCurrentPhase(tokenAmountToReceive);
-        totalSold += tokenAmountToReceive;
+        uint256 tokenAmountToReceive =
+            amountToPay_ * 10 ** (18 - tokenDecimals_) * PRICE_USD_DECIMALS / phases[currentPhase].price; // 18 decimals
 
         // CEI Pattern
-        require(totalSold <= MAX_TOKENS_FOR_SALE, "Sold out");
+        require(totalSold + tokenAmountToReceive <= accumulatedTokens, "Exceeded limit to buy in this phase");
+        totalSold += tokenAmountToReceive;
         userBalances[msg.sender] += tokenAmountToReceive;
-        IERC20(tokenUsedToBuy_).safeTransferFrom(msg.sender, fundsReceiver, tokenAmountToReceive);
-        emit TokenBuy(tokenUsedToBuy_, amount_);
+        IERC20(tokenUsedToBuy_).safeTransferFrom(msg.sender, fundsReceiver, amountToPay_);
+        emit TokenBuy(tokenUsedToBuy_, amountToPay_);
+    }
+
+    function calculateCurrentPhase() public view returns (uint256, uint256) {
+        uint256 currentTime = block.timestamp;
+        if (currentTime < STARTING_PERIOD) revert PresaleNotStarted();
+        if (currentTime >= ENDING_PERIOD) revert PresaleTimeFinished();
+        uint256 currentTokensSold = totalSold;
+        uint256 accumulatedTokens = 0;
+        for (uint256 i = 0; i < PRESALE_PHASES; i++) {
+            Phase memory phase = phases[i];
+            accumulatedTokens += phase.amount;
+            if (currentTime < phase.endTime && currentTokensSold < accumulatedTokens) {
+                return (i, accumulatedTokens);
+            }
+        }
+        revert PresaleSoldOut();
     }
 
     // ---- ADMIN FUNCTIONS ----
@@ -123,14 +144,5 @@ contract Presale is Ownable {
         uint256 balance_ = address(this).balance;
         (bool success,) = msg.sender.call{value: balance_}("");
         require(success, "ETH withdraw failed");
-    }
-
-    function checkCurrentPhase(uint256 amount_) private returns(uint256 phase_) {
-        if ((totalSold + amount_ >= phases[currentPhase].amount || block.timestamp >= phases[currentPhase].endTime) && currentPhase < PRESALE_PHASES) {
-            currentPhase ++;
-            phase_ = currentPhase;
-        } else {
-            phase_ = currentPhase;
-        }
     }
 }
