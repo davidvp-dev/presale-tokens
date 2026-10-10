@@ -204,5 +204,39 @@ contract Presale is Ownable {
         uint256 balance_ = address(this).balance;
         (bool success,) = msg.sender.call{value: balance_}("");
         require(success, "ETH withdraw failed");
+        emit EmergencyWithdraw(address(0), balance);
+    }
+
+    /**
+     * @notice Sends unsold presale tokens to the funds receiver after the sale ends.
+     * @dev Can only be called by the owner once the presale has completed.
+     *      Reverts if all tokens were already sold or if no tokens remain to withdraw.
+     */
+    function withdrawRemainingPresaleTokens() external onlyOwner {
+        if (block.timestamp < ENDING_PERIOD) revert PresaleNotFinished();
+        uint256 remainingAmount = MAX_TOKENS_FOR_SALE - totalSold;
+        if (remainingAmount == 0) revert PresaleSoldOut();
+        IERC20(PRESALE_TOKEN).safeTransfer(fundsReceiver, remainingAmount);
+        emit WithdrawnRemainingTokens(remainingAmount);
+    }
+
+    /**
+     * @notice Transfers the presale token supply from the treasury to this contract.
+     * @dev Can only be called by the owner to fund the presale with the full token allocation.
+     */
+    function pullPresaleTokensFromTreasury() external onlyOwner {
+        IERC20(PRESALE_TOKEN).safeTransferFrom(TREASURY, address(this), MAX_TOKENS_FOR_SALE);
+        emit PresaleFundedFromTreasury();
+    }
+
+    /**
+     * @notice Updates the address that receives funds and remaining token withdrawals.
+     * @dev Can only be called by the owner. The new receiver must not be the zero address.
+     * @param newFundsReceiver_ The new address to receive stablecoin payments and emergency withdrawals.
+     */
+    function updateFundsReceiver(address newFundsReceiver_) external onlyOwner {
+        if (newFundsReceiver_ == address(0)) revert ZeroAddress();
+        fundsReceiver = newFundsReceiver_;
+        emit FundsReceiverUpdated(newFundsReceiver_);
     }
 }
