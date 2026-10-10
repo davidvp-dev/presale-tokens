@@ -19,6 +19,7 @@ error PresaleNotFinished();
 error PresaleTimeFinished();
 error PresaleSoldOut();
 error NoTokensToClaim();
+error AlreadyFundedFromTreasury();
 
 /*
 * Phase 1) 2M tokens at 0,005$
@@ -33,28 +34,40 @@ contract Presale is Ownable {
 
     struct Phase {
         uint128 amount; // 18 decimals
-        uint128 price; // USD  6 decimals (0,005$ = 5_000)
+        uint128 price; // USD 6 decimals (0,005$ = 5_000)
         uint64 endTime; // timestamp Unix
     }
 
     address public immutable USDC;
     address public immutable USDT;
-    address public immutable PRESALE_TOKEN_ADDRESS;
+    address public immutable PRESALE_TOKEN;
+    address public immutable TREASURY;
     uint256 public immutable STARTING_PERIOD;
     uint256 public immutable ENDING_PERIOD;
     uint256 public constant MAX_TOKENS_FOR_SALE = 10_000_000e18; // 10M tokens with 18 decimals
-    uint256 public constant PRICE_USD_DECIMALS = 1e6;
+    uint256 public constant MIN_BUY_AMOUNT = 10e6; // 10$ min amount
+    uint256 public constant PRICE_PRECISION = 1e6; // price $ decimals (6)
+    uint256 public immutable PRESALE_TOKEN_DECIMALS;
     uint8 public constant PRESALE_PHASES = 3;
 
     address public fundsReceiver;
     uint256 public totalSold;
     Phase[PRESALE_PHASES] public phases;
+    bool public fundedFromTreasury = false;
 
     mapping(address => bool) public isBlacklisted;
     mapping(address => uint256) public userBalances;
 
-    event TokensPurchased(address indexed buyer, address indexed paymentToken, uint256 amountIn, uint256 tokensOut, uint256 phase);
+    event TokensPurchased(
+        address indexed buyer, address indexed paymentToken, uint256 amountIn, uint256 tokensOut, uint256 phase
+    );
     event TokensClaimed(address indexed user, uint256 amount);
+    event UserBlacklisted(address indexed user);
+    event UserRemovedFromBlacklist(address indexed user);
+    event PresaleFundedFromTreasury(uint256 amount);
+    event FundsReceiverUpdated(address indexed newFundsReceiver);
+    event WithdrawnRemainingTokens(address indexed user, uint256 amount);
+    event EmergencyWithdraw(address indexed token, uint256 amount);
 
     /**
      * @notice Deploys the presale and configures its tokens, funds receiver, and phases.
@@ -71,13 +84,14 @@ contract Presale is Ownable {
         address usdc_,
         address usdt_,
         address presaleTokenAddress_,
+        address treasury_,
         address fundsReceiver_,
         uint256 startingPeriod_,
         Phase[PRESALE_PHASES] memory phases_
     ) Ownable(msg.sender) {
         if (
             usdc_ == address(0) || usdt_ == address(0) || fundsReceiver_ == address(0)
-                || presaleTokenAddress_ == address(0)
+                || presaleTokenAddress_ == address(0) || treasury_ == address(0)
         ) {
             revert ZeroAddress();
         }
@@ -100,29 +114,35 @@ contract Presale is Ownable {
 
         if (totalAmount != MAX_TOKENS_FOR_SALE) revert InvalidTotalPhaseAmount(totalAmount, MAX_TOKENS_FOR_SALE);
 
+        fundsReceiver = fundsReceiver_;
         USDC = usdc_;
         USDT = usdt_;
-        PRESALE_TOKEN_ADDRESS = presaleTokenAddress_;
-        fundsReceiver = fundsReceiver_;
+        PRESALE_TOKEN = presaleTokenAddress_;
+        PRESALE_TOKEN_DECIMALS = IERC20Metadata(PRESALE_TOKEN).decimals();
+        TREASURY = treasury_;
         STARTING_PERIOD = startingPeriod_;
         ENDING_PERIOD = phases_[PRESALE_PHASES - 1].endTime;
     }
 
     /**
-     * @notice Purchases presale tokens using USDC or USDT.
-     * @dev The buyer must have approved the payment amount and must not be blacklisted.
-     *      Purchased tokens accrue for claiming after the entire presale has ended.
-     * @param tokenUsedToBuy_ Address of the payment token (USDC or USDT).
-     * @param amountToPay_ Payment amount, expressed using the payment token's decimals.
+     * @notice Buys presale tokens by paying with USDC or USDT.
+     * @dev The buyer must have approved the payment amount, not be blacklisted,
+     *      and the purchase must remain within the active phase token cap.
+     *      Tokens are accumulated in the user's balance and can be claimed after the presale ends.
+     * @param tokenUsedToBuy_ Address of the stablecoin used for payment: USDC or USDT.
+     * @param amountToPay_ Payment amount in the stablecoin's smallest unit.
      */
     function buyWithStables(address tokenUsedToBuy_, uint256 amountToPay_) external {
+        require(fundedFromTreasury, "The presale is not active yet");
         require(!isBlacklisted[msg.sender], "You are not allowed to buy this presale");
         require(tokenUsedToBuy_ == USDT || tokenUsedToBuy_ == USDC, "Please use USDC or USDT to buy");
+        require(amountToPay_ >= MIN_BUY_AMOUNT, "Amount must be 10$ or greater");
 
         (uint256 currentPhase, uint256 accumulatedTokens) = calculateCurrentPhase();
         uint256 tokenDecimals = IERC20Metadata(tokenUsedToBuy_).decimals();
-        uint256 tokenAmountToReceive =
-            amountToPay_ * 10 ** (18 - tokenDecimals) * PRICE_USD_DECIMALS / phases[currentPhase].price; // 18 decimals
+        uint256 tokenAmountToReceive = amountToPay_ * 10 ** (PRESALE_TOKEN_DECIMALS - tokenDecimals) * PRICE_PRECISION
+            / phases[currentPhase].price;
+        require(tokenAmountToReceive > 0, "The calculated tokens to receive is 0");
 
         // CEI Pattern
         require(totalSold + tokenAmountToReceive <= accumulatedTokens, "Exceeded limit to buy in this phase");
@@ -133,15 +153,16 @@ contract Presale is Ownable {
     }
 
     /**
-     * @notice Claims purchased tokens after the presale has ended.
-     * @dev Sets the pending balance to zero before transferring to prevent duplicate claims.
+     * @notice Claims all tokens bought by the caller after the presale ends.
+     * @dev Reverts until the full presale schedule has completed. The pending balance is cleared
+     *      before the transfer to prevent duplicate claims and the call reverts if no tokens are available.
      */
     function claim() external {
         if (block.timestamp < ENDING_PERIOD) revert PresaleNotFinished();
         uint256 tokensToClaim = userBalances[msg.sender];
         if (tokensToClaim == 0) revert NoTokensToClaim();
         userBalances[msg.sender] = 0;
-        IERC20(PRESALE_TOKEN_ADDRESS).safeTransfer(msg.sender, tokensToClaim);
+        IERC20(PRESALE_TOKEN).safeTransfer(msg.sender, tokensToClaim);
         emit TokensClaimed(msg.sender, tokensToClaim);
     }
 
@@ -175,6 +196,7 @@ contract Presale is Ownable {
      */
     function blacklist(address user_) external onlyOwner {
         isBlacklisted[user_] = true;
+        emit UserBlacklisted(user_);
     }
 
     /**
@@ -184,6 +206,7 @@ contract Presale is Ownable {
      */
     function removeBlacklist(address user_) external onlyOwner {
         isBlacklisted[user_] = false;
+        emit UserRemovedFromBlacklist(user_);
     }
 
     /**
@@ -193,16 +216,18 @@ contract Presale is Ownable {
      * @param amount_ Amount of tokens to withdraw, expressed in the token's smallest units.
      */
     function emergencyERC20Withdraw(address tokenAddress_, uint256 amount_) external onlyOwner {
-        IERC20(tokenAddress_).safeTransfer(msg.sender, amount_);
+        require(tokenAddress_ != PRESALE_TOKEN, "Can't withdraw presale tokens");
+        IERC20(tokenAddress_).safeTransfer(fundsReceiver, amount_);
+        emit EmergencyWithdraw(tokenAddress_, amount_);
     }
 
     /**
-     * @notice Withdraws all ETH held by the contract to the owner.
-     * @dev Can only be called by the contract owner and reverts if the transfer fails.
+     * @notice Withdraws all ETH held by the contract to the configured funds receiver.
+     * @dev Can only be called by the contract owner. The transfer is reverted if the call fails.
      */
     function emergencyEthWithdraw() external onlyOwner {
-        uint256 balance_ = address(this).balance;
-        (bool success,) = msg.sender.call{value: balance_}("");
+        uint256 balance = address(this).balance;
+        (bool success,) = fundsReceiver.call{value: balance}("");
         require(success, "ETH withdraw failed");
         emit EmergencyWithdraw(address(0), balance);
     }
@@ -216,8 +241,10 @@ contract Presale is Ownable {
         if (block.timestamp < ENDING_PERIOD) revert PresaleNotFinished();
         uint256 remainingAmount = MAX_TOKENS_FOR_SALE - totalSold;
         if (remainingAmount == 0) revert PresaleSoldOut();
-        IERC20(PRESALE_TOKEN).safeTransfer(fundsReceiver, remainingAmount);
-        emit WithdrawnRemainingTokens(remainingAmount);
+
+        totalSold += remainingAmount; // only withdraw once
+        IERC20(PRESALE_TOKEN).safeTransfer(TREASURY, remainingAmount);
+        emit WithdrawnRemainingTokens(TREASURY, remainingAmount);
     }
 
     /**
@@ -225,8 +252,11 @@ contract Presale is Ownable {
      * @dev Can only be called by the owner to fund the presale with the full token allocation.
      */
     function pullPresaleTokensFromTreasury() external onlyOwner {
-        IERC20(PRESALE_TOKEN).safeTransferFrom(TREASURY, address(this), MAX_TOKENS_FOR_SALE);
-        emit PresaleFundedFromTreasury();
+        if (!fundedFromTreasury) {
+            fundedFromTreasury = true;
+            IERC20(PRESALE_TOKEN).safeTransferFrom(TREASURY, address(this), MAX_TOKENS_FOR_SALE);
+            emit PresaleFundedFromTreasury(MAX_TOKENS_FOR_SALE);
+        } else revert AlreadyFundedFromTreasury();
     }
 
     /**
