@@ -20,6 +20,7 @@ error PresaleTimeFinished();
 error PresaleSoldOut();
 error NoTokensToClaim();
 error AlreadyFundedFromTreasury();
+error AlreadyWithdrawnRemainingTokens();
 
 /*
 * Phase 1) 2M tokens at 0,005$
@@ -54,6 +55,7 @@ contract Presale is Ownable {
     uint256 public totalSold;
     Phase[PRESALE_PHASES] public phases;
     bool public fundedFromTreasury = false;
+    bool public tokensRemaining = false;
 
     mapping(address => bool) public isBlacklisted;
     mapping(address => uint256) public userBalances;
@@ -238,13 +240,16 @@ contract Presale is Ownable {
      *      Reverts if all tokens were already sold or if no tokens remain to withdraw.
      */
     function withdrawRemainingPresaleTokens() external onlyOwner {
-        if (block.timestamp < ENDING_PERIOD) revert PresaleNotFinished();
-        uint256 remainingAmount = MAX_TOKENS_FOR_SALE - totalSold;
-        if (remainingAmount == 0) revert PresaleSoldOut();
-
-        totalSold += remainingAmount; // only withdraw once
-        IERC20(PRESALE_TOKEN).safeTransfer(TREASURY, remainingAmount);
-        emit WithdrawnRemainingTokens(TREASURY, remainingAmount);
+        if (!tokensRemaining) {
+            if (block.timestamp < ENDING_PERIOD) revert PresaleNotFinished();
+            uint256 remainingAmount = MAX_TOKENS_FOR_SALE - totalSold;
+            if (remainingAmount == 0) revert PresaleSoldOut();
+            tokensRemaining = true;
+            IERC20(PRESALE_TOKEN).safeTransfer(TREASURY, remainingAmount);
+            emit WithdrawnRemainingTokens(TREASURY, remainingAmount);
+        } else {
+            revert AlreadyWithdrawnRemainingTokens();
+        }
     }
 
     /**
@@ -256,7 +261,9 @@ contract Presale is Ownable {
             fundedFromTreasury = true;
             IERC20(PRESALE_TOKEN).safeTransferFrom(TREASURY, address(this), MAX_TOKENS_FOR_SALE);
             emit PresaleFundedFromTreasury(MAX_TOKENS_FOR_SALE);
-        } else revert AlreadyFundedFromTreasury();
+        } else {
+            revert AlreadyFundedFromTreasury();
+        }
     }
 
     /**
