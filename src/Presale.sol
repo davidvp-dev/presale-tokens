@@ -6,6 +6,8 @@ import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.so
 import {IERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "../lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "../lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol";
+import {IAggregator} from "./interfaces/IAggregator.sol";
 
 error ZeroAddress();
 error SameStablecoin();
@@ -43,12 +45,16 @@ contract Presale is Ownable {
     address public immutable USDT;
     address public immutable PRESALE_TOKEN;
     address public immutable TREASURY;
+    address public immutable DATA_FEED_ADDRESS;
+    uint8 public immutable DATA_FEED_DECIMALS;
     uint256 public immutable STARTING_PERIOD;
     uint256 public immutable ENDING_PERIOD;
+    uint256 public immutable PRESALE_TOKEN_DECIMALS;
     uint256 public constant MAX_TOKENS_FOR_SALE = 10_000_000e18; // 10M tokens with 18 decimals
     uint256 public constant MIN_BUY_AMOUNT = 10e6; // 10$ min amount
-    uint256 public constant PRICE_PRECISION = 1e6; // price $ decimals (6)
-    uint256 public immutable PRESALE_TOKEN_DECIMALS;
+    uint256 public constant PRICE_DECIMALS = 6;
+    uint256 public constant ETH_DECIMALS = 18; // 1 ETH = 1e18 wei
+    uint256 public constant ETH_PRICE_DECIMALS = 18; // scale of getEtherPrice()
     uint8 public constant PRESALE_PHASES = 3;
 
     address public fundsReceiver;
@@ -78,7 +84,9 @@ contract Presale is Ownable {
      * @param usdc_ Address of the USDC contract accepted for purchases.
      * @param usdt_ Address of the USDT contract accepted for purchases.
      * @param presaleTokenAddress_ Address of the token that will be distributed to buyers.
+     * @param treasury_ Address holding the presale token allocation.
      * @param fundsReceiver_ Address that will receive purchase payments.
+     * @param dataFeedAddress_ Address of the ETH/USD price feed.
      * @param startingPeriod_ Unix timestamp when the presale starts.
      * @param phases_ Phase configuration: token amount, price, and end time.
      */
@@ -88,12 +96,13 @@ contract Presale is Ownable {
         address presaleTokenAddress_,
         address treasury_,
         address fundsReceiver_,
+        address dataFeedAddress_,
         uint256 startingPeriod_,
         Phase[PRESALE_PHASES] memory phases_
     ) Ownable(msg.sender) {
         if (
             usdc_ == address(0) || usdt_ == address(0) || fundsReceiver_ == address(0)
-                || presaleTokenAddress_ == address(0) || treasury_ == address(0)
+                || presaleTokenAddress_ == address(0) || treasury_ == address(0) || dataFeedAddress_ == address(0)
         ) {
             revert ZeroAddress();
         }
@@ -124,6 +133,8 @@ contract Presale is Ownable {
         TREASURY = treasury_;
         STARTING_PERIOD = startingPeriod_;
         ENDING_PERIOD = phases_[PRESALE_PHASES - 1].endTime;
+        DATA_FEED_ADDRESS = dataFeedAddress_;
+        DATA_FEED_DECIMALS = IAggregator(DATA_FEED_ADDRESS).decimals();
     }
 
     /**
@@ -138,12 +149,17 @@ contract Presale is Ownable {
         require(fundedFromTreasury, "The presale is not active yet");
         require(!isBlacklisted[msg.sender], "You are not allowed to buy this presale");
         require(tokenUsedToBuy_ == USDT || tokenUsedToBuy_ == USDC, "Please use USDC or USDT to buy");
-        require(amountToPay_ >= MIN_BUY_AMOUNT, "Amount must be 10$ or greater");
+        uint256 tokenDecimals = IERC20Metadata(tokenUsedToBuy_).decimals();
+        //amountToPay has X decimals and MIN_BUY_AMOUNT has 6 decimals
+        //we can either normalize amountToPay to 6 decimals, or MIN_BUY_AMOUNT to X decimals
+        //its better the 2nd way, so there's nothing lost in the division
+        require(
+            amountToPay_ >= (MIN_BUY_AMOUNT * 10 ** (tokenDecimals - PRICE_DECIMALS)), "Amount must be 10$ or greater"
+        );
 
         (uint256 currentPhase, uint256 accumulatedTokens) = calculateCurrentPhase();
-        uint256 tokenDecimals = IERC20Metadata(tokenUsedToBuy_).decimals();
-        uint256 tokenAmountToReceive = amountToPay_ * 10 ** (PRESALE_TOKEN_DECIMALS - tokenDecimals) * PRICE_PRECISION
-            / phases[currentPhase].price;
+        uint256 tokenAmountToReceive = amountToPay_ * 10 ** (PRESALE_TOKEN_DECIMALS - tokenDecimals) * 10
+            ** PRICE_DECIMALS / phases[currentPhase].price;
         require(tokenAmountToReceive > 0, "The calculated tokens to receive is 0");
 
         // CEI Pattern
@@ -152,6 +168,33 @@ contract Presale is Ownable {
         userBalances[msg.sender] += tokenAmountToReceive;
         IERC20(tokenUsedToBuy_).safeTransferFrom(msg.sender, fundsReceiver, amountToPay_);
         emit TokensPurchased(msg.sender, tokenUsedToBuy_, amountToPay_, tokenAmountToReceive, currentPhase);
+    }
+
+    /**
+     * @notice Buys presale tokens by paying with ETH.
+     * @dev The presale must be funded, the buyer must not be blacklisted, and the ETH value must meet the minimum purchase.
+     *      The ETH payment is forwarded to the funds receiver, and purchased tokens can be claimed after the presale ends.
+     */
+    function buyWithEther() external payable {
+        require(fundedFromTreasury, "The presale is not active yet");
+        require(!isBlacklisted[msg.sender], "You are not allowed to buy this presale");
+        uint256 usdValue = msg.value * getEtherPrice() / (10 ** ETH_DECIMALS);
+        require(
+            usdValue >= (MIN_BUY_AMOUNT * 10 ** (ETH_PRICE_DECIMALS - PRICE_DECIMALS)), "Amount must be 10$ or greater"
+        );
+
+        (uint256 currentPhase, uint256 accumulatedTokens) = calculateCurrentPhase();
+        uint256 tokenAmountToReceive = usdValue * 10 ** (PRESALE_TOKEN_DECIMALS - ETH_PRICE_DECIMALS) * 10
+            ** PRICE_DECIMALS / phases[currentPhase].price;
+        require(tokenAmountToReceive > 0, "The calculated tokens to receive is 0");
+
+        // CEI Pattern
+        require(totalSold + tokenAmountToReceive <= accumulatedTokens, "Exceeded limit to buy in this phase");
+        totalSold += tokenAmountToReceive;
+        userBalances[msg.sender] += tokenAmountToReceive;
+        (bool success,) = fundsReceiver.call{value: msg.value}("");
+        require(success, "Error sending ETH to the funds receiver");
+        emit TokensPurchased(msg.sender, address(0), msg.value, tokenAmountToReceive, currentPhase);
     }
 
     /**
@@ -166,28 +209,6 @@ contract Presale is Ownable {
         userBalances[msg.sender] = 0;
         IERC20(PRESALE_TOKEN).safeTransfer(msg.sender, tokensToClaim);
         emit TokensClaimed(msg.sender, tokensToClaim);
-    }
-
-    /**
-     * @notice Calculates the active phase and the cumulative token limit available through that phase.
-     * @dev Reverts if the presale has not started, has ended, or has no tokens remaining.
-     * @return phaseIndex Index of the active phase, starting from zero.
-     * @return accumulatedTokens Maximum cumulative number of tokens available through this phase.
-     */
-    function calculateCurrentPhase() public view returns (uint256, uint256) {
-        uint256 currentTime = block.timestamp;
-        if (currentTime < STARTING_PERIOD) revert PresaleNotStarted();
-        if (currentTime >= ENDING_PERIOD) revert PresaleTimeFinished();
-        uint256 currentTokensSold = totalSold;
-        uint256 accumulatedTokens = 0;
-        for (uint256 i = 0; i < PRESALE_PHASES; i++) {
-            Phase memory phase = phases[i];
-            accumulatedTokens += phase.amount;
-            if (currentTime < phase.endTime && currentTokensSold < accumulatedTokens) {
-                return (i, accumulatedTokens);
-            }
-        }
-        revert PresaleSoldOut();
     }
 
     // ---- ADMIN FUNCTIONS ----
@@ -275,5 +296,41 @@ contract Presale is Ownable {
         if (newFundsReceiver_ == address(0)) revert ZeroAddress();
         fundsReceiver = newFundsReceiver_;
         emit FundsReceiverUpdated(newFundsReceiver_);
+    }
+
+    /**
+     * @notice Calculates the active phase and the cumulative token limit available through that phase.
+     * @dev Reverts if the presale has not started, has ended, or has no tokens remaining.
+     * @return phaseIndex Index of the active phase, starting from zero.
+     * @return accumulatedTokens Maximum cumulative number of tokens available through this phase.
+     */
+    function calculateCurrentPhase() public view returns (uint256, uint256) {
+        uint256 currentTime = block.timestamp;
+        if (currentTime < STARTING_PERIOD) revert PresaleNotStarted();
+        if (currentTime >= ENDING_PERIOD) revert PresaleTimeFinished();
+        uint256 currentTokensSold = totalSold;
+        uint256 accumulatedTokens = 0;
+        for (uint256 i = 0; i < PRESALE_PHASES; i++) {
+            Phase memory phase = phases[i];
+            accumulatedTokens += phase.amount;
+            if (currentTime < phase.endTime && currentTokensSold < accumulatedTokens) {
+                return (i, accumulatedTokens);
+            }
+        }
+        revert PresaleSoldOut();
+    }
+
+    /**
+     * @notice Returns the current ETH price from the configured price feed.
+     * @dev The returned price uses 18 decimals by default; this scale is configurable through ETH_PRICE_DECIMALS.
+     * @return etherPrice ETH price with ETH_PRICE_DECIMALS decimals.
+     */
+    function getEtherPrice() public view returns (uint256) {
+        (, int256 etherPrice,,,) = IAggregator(DATA_FEED_ADDRESS).latestRoundData();
+        require(etherPrice > 0, "Invalid price received from the Price Feeds");
+
+        uint256 uintEtherPrice = SafeCast.toUint256(etherPrice);
+        uintEtherPrice = uintEtherPrice * (10 ** ETH_PRICE_DECIMALS) / (10 ** DATA_FEED_DECIMALS);
+        return uintEtherPrice;
     }
 }
