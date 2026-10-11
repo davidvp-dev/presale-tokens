@@ -41,6 +41,15 @@ contract Presale is Ownable {
         uint64 endTime; // timestamp Unix
     }
 
+    // ---- Constants ----
+    uint256 public constant MAX_TOKENS_FOR_SALE = 10_000_000e18; // 10M tokens with 18 decimals
+    uint256 public constant MIN_BUY_AMOUNT = 10e6; // 10$ min amount
+    uint256 public constant PRICE_DECIMALS = 6;
+    uint256 public constant ETH_DECIMALS = 18; // 1 ETH = 1e18 wei
+    uint256 public constant ETH_PRICE_DECIMALS = 18; // scale of getEtherPrice()
+    uint8 public constant PRESALE_PHASES = 3;
+
+    // ---- Immutables (set in constructor) ----
     address public immutable USDC;
     address public immutable USDT;
     address public immutable PRESALE_TOKEN;
@@ -50,19 +59,13 @@ contract Presale is Ownable {
     uint256 public immutable STARTING_PERIOD;
     uint256 public immutable ENDING_PERIOD;
     uint256 public immutable PRESALE_TOKEN_DECIMALS;
-    uint256 public constant MAX_TOKENS_FOR_SALE = 10_000_000e18; // 10M tokens with 18 decimals
-    uint256 public constant MIN_BUY_AMOUNT = 10e6; // 10$ min amount
-    uint256 public constant PRICE_DECIMALS = 6;
-    uint256 public constant ETH_DECIMALS = 18; // 1 ETH = 1e18 wei
-    uint256 public constant ETH_PRICE_DECIMALS = 18; // scale of getEtherPrice()
-    uint8 public constant PRESALE_PHASES = 3;
 
+    // ---- Storage ----
     address public fundsReceiver;
     uint256 public totalSold;
     Phase[PRESALE_PHASES] public phases;
     bool public fundedFromTreasury = false;
     bool public tokensRemaining = false;
-
     mapping(address => bool) public isBlacklisted;
     mapping(address => uint256) public userBalances;
 
